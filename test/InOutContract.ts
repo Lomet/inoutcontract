@@ -158,33 +158,30 @@ describe("InOutContract", async function () {
     // Add only one signer
     await inOutContract.write.addSigner([signer.account.address]);
 
-    const depositAmount = parseEther("100");
     const withdrawAmount = parseEther("50");
 
-    // Mint and deposit tokens
-    await mockToken.write.mint([user.account.address, depositAmount]);
-    await mockToken.write.approve([inOutContract.address, depositAmount], { account: user.account });
-    await inOutContract.write.deposit([depositAmount], { account: user.account });
+    // Mint tokens directly to contract
+    await mockToken.write.mint([inOutContract.address, withdrawAmount]);
 
-    // Prepare withdrawal signature with invalid signer
-    const expectedTransactionIndex = 1n;
+    // Get current nonce
+    const nonce = await inOutContract.read.nonces([user.account.address]);
+    
+    // Prepare withdrawal signature with invalid signer using ERC-712
     const validUntil = BigInt(Math.floor(Date.now() / 1000) + 3600);
 
-    const messageHash = keccak256(
-      encodePacked(
-        ["address", "uint256", "uint256", "uint256", "address"],
-        [user.account.address, withdrawAmount, expectedTransactionIndex, validUntil, inOutContract.address]
-      )
+    const invalidSignature = await signWithdrawal(
+      invalidSigner,
+      inOutContract.address,
+      user.account.address,
+      withdrawAmount,
+      nonce,
+      validUntil,
+      mockToken.address
     );
-
-    // Sign with invalid signer
-    const invalidSignature = await invalidSigner.signMessage({
-      message: { raw: messageHash },
-    });
 
     // Should reject withdrawal
     try {
-      await inOutContract.write.withdraw([withdrawAmount, expectedTransactionIndex, validUntil, invalidSignature], { account: user.account });
+      await inOutContract.write.withdraw([withdrawAmount, validUntil, invalidSignature], { account: user.account });
       assert.fail("Should have thrown an error");
     } catch (error: any) {
       assert(error.message.includes("Invalid signer"));
@@ -203,40 +200,38 @@ describe("InOutContract", async function () {
     // Add signer
     await inOutContract.write.addSigner([signer.account.address]);
 
-    const depositAmount = parseEther("100");
     const withdrawAmount = parseEther("50");
 
-    // Mint and deposit tokens
-    await mockToken.write.mint([user.account.address, depositAmount]);
-    await mockToken.write.approve([inOutContract.address, depositAmount], { account: user.account });
-    await inOutContract.write.deposit([depositAmount], { account: user.account });
+    // Mint tokens directly to contract
+    await mockToken.write.mint([inOutContract.address, withdrawAmount]);
 
+    // Get current nonce
+    const nonce = await inOutContract.read.nonces([user.account.address]);
+    
     // Prepare withdrawal signature with expired timestamp
-    const expectedTransactionIndex = 1n;
     const validUntil = BigInt(Math.floor(Date.now() / 1000) - 3600); // 1 hour ago (expired)
 
-    const messageHash = keccak256(
-      encodePacked(
-        ["address", "uint256", "uint256", "uint256", "address"],
-        [user.account.address, withdrawAmount, expectedTransactionIndex, validUntil, inOutContract.address]
-      )
+    const signature = await signWithdrawal(
+      signer,
+      inOutContract.address,
+      user.account.address,
+      withdrawAmount,
+      nonce,
+      validUntil,
+      mockToken.address
     );
-
-    const signature = await signer.signMessage({
-      message: { raw: messageHash },
-    });
 
     // Should reject withdrawal
     try {
-      await inOutContract.write.withdraw([withdrawAmount, expectedTransactionIndex, validUntil, signature], { account: user.account });
+      await inOutContract.write.withdraw([withdrawAmount, validUntil, signature], { account: user.account });
       assert.fail("Should have thrown an error");  
     } catch (error: any) {
       assert(error.message.includes("Signature expired"));
     }
   });
 
-  it("Should allow fetching all user transactions", async function () {
-    const [, user] = await viem.getWalletClients();
+  it("Should reject withdrawals when paused", async function () {
+    const [, signer, user] = await viem.getWalletClients();
     
     // Deploy mock ERC20 token
     const mockToken = await viem.deployContract("MockERC20", ["Test Token", "TEST"]);
@@ -244,30 +239,43 @@ describe("InOutContract", async function () {
     // Deploy InOutContract
     const inOutContract = await viem.deployContract("InOutContract", [mockToken.address]);
 
-    const amount1 = parseEther("100");
-    const amount2 = parseEther("200");
+    // Add signer
+    await inOutContract.write.addSigner([signer.account.address]);
 
-    // Mint tokens to user
-    await mockToken.write.mint([user.account.address, amount1 + amount2]);
+    const withdrawAmount = parseEther("50");
 
-    // Approve tokens for contract
-    await mockToken.write.approve([inOutContract.address, amount1 + amount2], { account: user.account });
+    // Mint tokens directly to contract
+    await mockToken.write.mint([inOutContract.address, withdrawAmount]);
 
-    // Make two deposits
-    await inOutContract.write.deposit([amount1], { account: user.account });
-    await inOutContract.write.deposit([amount2], { account: user.account });
-
-    // Fetch all transactions
-    const transactions = await inOutContract.read.getUserTransactions([user.account.address]);
+    // Get current nonce
+    const nonce = await inOutContract.read.nonces([user.account.address]);
     
-    assert.equal(transactions.length, 2);
-    assert.equal(transactions[0].amount, amount1);
-    assert.equal(transactions[0].isDeposit, true);
-    assert.equal(transactions[1].amount, amount2);
-    assert.equal(transactions[1].isDeposit, true);
+    // Prepare withdrawal signature
+    const validUntil = BigInt(Math.floor(Date.now() / 1000) + 3600);
+
+    const signature = await signWithdrawal(
+      signer,
+      inOutContract.address,
+      user.account.address,
+      withdrawAmount,
+      nonce,
+      validUntil,
+      mockToken.address
+    );
+
+    // Pause the contract
+    await inOutContract.write.pause();
+
+    // Should reject withdrawal when paused
+    try {
+      await inOutContract.write.withdraw([withdrawAmount, validUntil, signature], { account: user.account });
+      assert.fail("Should have thrown an error");
+    } catch (error: any) {
+      assert(error.message.includes("EnforcedPause"));
+    }
   });
 
-  it("Should reject deposits with zero amount", async function () {
+  it("Should reject withdrawals with zero amount", async function () {
     const [, user] = await viem.getWalletClients();
     
     // Deploy mock ERC20 token
@@ -276,9 +284,11 @@ describe("InOutContract", async function () {
     // Deploy InOutContract
     const inOutContract = await viem.deployContract("InOutContract", [mockToken.address]);
 
-    // Should reject zero amount deposit
+    const validUntil = BigInt(Math.floor(Date.now() / 1000) + 3600);
+    
+    // Should reject zero amount withdrawal
     try {
-      await inOutContract.write.deposit([0n], { account: user.account });
+      await inOutContract.write.withdraw([0n, validUntil, "0x00"], { account: user.account });
       assert.fail("Should have thrown an error");
     } catch (error: any) {
       assert(error.message.includes("Amount must be greater than 0"));
@@ -302,7 +312,7 @@ describe("InOutContract", async function () {
   });
 
   it("Should test emergency withdraw function", async function () {
-    const [owner, user] = await viem.getWalletClients();
+    const [owner] = await viem.getWalletClients();
     
     // Deploy mock ERC20 token
     const mockToken = await viem.deployContract("MockERC20", ["Test Token", "TEST"]);
@@ -312,10 +322,8 @@ describe("InOutContract", async function () {
 
     const depositAmount = parseEther("100");
 
-    // Mint and deposit tokens
-    await mockToken.write.mint([user.account.address, depositAmount]);
-    await mockToken.write.approve([inOutContract.address, depositAmount], { account: user.account });
-    await inOutContract.write.deposit([depositAmount], { account: user.account });
+    // Mint tokens directly to contract
+    await mockToken.write.mint([inOutContract.address, depositAmount]);
 
     // Check owner balance before emergency withdraw
     const ownerBalanceBefore = await mockToken.read.balanceOf([owner.account.address]);
@@ -332,7 +340,7 @@ describe("InOutContract", async function () {
     assert.equal(contractBalance, 0n);
   });
 
-  it("Should reject invalid transaction index for withdrawals", async function () {
+  it("Should prevent replay attacks with nonce increment", async function () {
     const [, signer, user] = await viem.getWalletClients();
     
     // Deploy mock ERC20 token
@@ -344,35 +352,40 @@ describe("InOutContract", async function () {
     // Add signer
     await inOutContract.write.addSigner([signer.account.address]);
 
-    const depositAmount = parseEther("100");
     const withdrawAmount = parseEther("50");
 
-    // Mint and deposit tokens
-    await mockToken.write.mint([user.account.address, depositAmount]);
-    await mockToken.write.approve([inOutContract.address, depositAmount], { account: user.account });
-    await inOutContract.write.deposit([depositAmount], { account: user.account });
+    // Mint enough tokens to contract for two withdrawals
+    await mockToken.write.mint([inOutContract.address, withdrawAmount * 2n]);
 
-    // Try withdrawal with wrong transaction index
-    const wrongTransactionIndex = 5n; // Should be 1
+    // Get current nonce
+    const nonce = await inOutContract.read.nonces([user.account.address]);
+    
+    // Prepare withdrawal signature
     const validUntil = BigInt(Math.floor(Date.now() / 1000) + 3600);
 
-    const messageHash = keccak256(
-      encodePacked(
-        ["address", "uint256", "uint256", "uint256", "address"],
-        [user.account.address, withdrawAmount, wrongTransactionIndex, validUntil, inOutContract.address]
-      )
+    const signature = await signWithdrawal(
+      signer,
+      inOutContract.address,
+      user.account.address,
+      withdrawAmount,
+      nonce,
+      validUntil,
+      mockToken.address
     );
 
-    const signature = await signer.signMessage({
-      message: { raw: messageHash },
-    });
+    // First withdrawal should succeed
+    await inOutContract.write.withdraw([withdrawAmount, validUntil, signature], { account: user.account });
 
-    // Should reject withdrawal with invalid transaction index
+    // Verify nonce was incremented
+    const newNonce = await inOutContract.read.nonces([user.account.address]);
+    assert.equal(newNonce, nonce + 1n);
+
+    // Try to reuse the same signature - should fail
     try {
-      await inOutContract.write.withdraw([withdrawAmount, wrongTransactionIndex, validUntil, signature], { account: user.account });
+      await inOutContract.write.withdraw([withdrawAmount, validUntil, signature], { account: user.account });
       assert.fail("Should have thrown an error");
     } catch (error: any) {
-      assert(error.message.includes("Invalid transaction index"));
+      assert(error.message.includes("Invalid signer"));
     }
   });
 });
