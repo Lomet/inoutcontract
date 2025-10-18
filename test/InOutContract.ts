@@ -95,7 +95,7 @@ describe("InOutContract", async function () {
   });
 
   it("Should allow withdrawals with valid ERC-712 signer signature", async function () {
-    const [owner, signer, user] = await viem.getWalletClients();
+    const [, signer, user] = await viem.getWalletClients();
     
     // Deploy mock ERC20 token
     const mockToken = await viem.deployContract("MockERC20", ["Test Token", "TEST"]);
@@ -387,5 +387,101 @@ describe("InOutContract", async function () {
     } catch (error: any) {
       assert(error.message.includes("Invalid signer"));
     }
+  });
+
+  it("Should allow withdrawFor to withdraw to any address", async function () {
+    const [, signer, user, recipient] = await viem.getWalletClients();
+    
+    // Deploy mock ERC20 token
+    const mockToken = await viem.deployContract("MockERC20", ["Test Token", "TEST"]);
+
+    // Deploy InOutContract
+    const inOutContract = await viem.deployContract("InOutContract", [mockToken.address]);
+
+    // Add signer
+    await inOutContract.write.addSigner([signer.account.address]);
+
+    const withdrawAmount = parseEther("50");
+
+    // Mint tokens directly to contract
+    await mockToken.write.mint([inOutContract.address, withdrawAmount]);
+
+    // Get current nonce for user
+    const nonce = await inOutContract.read.nonces([user.account.address]);
+    
+    // Prepare withdrawal signature for user
+    const validUntil = BigInt(Math.floor(Date.now() / 1000) + 3600);
+
+    const signature = await signWithdrawal(
+      signer,
+      inOutContract.address,
+      user.account.address,
+      withdrawAmount,
+      nonce,
+      validUntil,
+      mockToken.address
+    );
+
+    // Get balances before withdrawal
+    const userBalanceBefore = await mockToken.read.balanceOf([user.account.address]);
+
+    // Recipient calls withdrawFor on behalf of user
+    await inOutContract.write.withdrawFor([user.account.address, withdrawAmount, validUntil, signature], { account: recipient.account });
+
+    // Verify user received tokens (not recipient who called the function)
+    const userBalanceAfter = await mockToken.read.balanceOf([user.account.address]);
+    assert.equal(userBalanceAfter, userBalanceBefore + withdrawAmount);
+
+    // Verify nonce was incremented for user
+    const newNonce = await inOutContract.read.nonces([user.account.address]);
+    assert.equal(newNonce, nonce + 1n);
+  });
+
+  it("Should allow user to call withdrawFor for themselves", async function () {
+    const [, signer, user] = await viem.getWalletClients();
+    
+    // Deploy mock ERC20 token
+    const mockToken = await viem.deployContract("MockERC20", ["Test Token", "TEST"]);
+
+    // Deploy InOutContract
+    const inOutContract = await viem.deployContract("InOutContract", [mockToken.address]);
+
+    // Add signer
+    await inOutContract.write.addSigner([signer.account.address]);
+
+    const withdrawAmount = parseEther("50");
+
+    // Mint tokens directly to contract
+    await mockToken.write.mint([inOutContract.address, withdrawAmount]);
+
+    // Get current nonce
+    const nonce = await inOutContract.read.nonces([user.account.address]);
+    
+    // Prepare withdrawal signature
+    const validUntil = BigInt(Math.floor(Date.now() / 1000) + 3600);
+
+    const signature = await signWithdrawal(
+      signer,
+      inOutContract.address,
+      user.account.address,
+      withdrawAmount,
+      nonce,
+      validUntil,
+      mockToken.address
+    );
+
+    // Get user balance before withdrawal
+    const userBalanceBefore = await mockToken.read.balanceOf([user.account.address]);
+
+    // User calls withdrawFor for themselves
+    await inOutContract.write.withdrawFor([user.account.address, withdrawAmount, validUntil, signature], { account: user.account });
+
+    // Verify user received tokens
+    const userBalanceAfter = await mockToken.read.balanceOf([user.account.address]);
+    assert.equal(userBalanceAfter, userBalanceBefore + withdrawAmount);
+
+    // Verify nonce was incremented
+    const newNonce = await inOutContract.read.nonces([user.account.address]);
+    assert.equal(newNonce, nonce + 1n);
   });
 });

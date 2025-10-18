@@ -35,11 +35,6 @@ contract InOutContract is Ownable, Pausable, ReentrancyGuard, EIP712 {
         token = IERC20(_token);
     }
 
-    modifier onlySigner() {
-        require(signers[msg.sender], "Not authorized signer");
-        _;
-    }
-
     // Owner functions
     function addSigner(address _signer) external onlyOwner {
         require(_signer != address(0), "Invalid signer address");
@@ -60,24 +55,25 @@ contract InOutContract is Ownable, Pausable, ReentrancyGuard, EIP712 {
         _unpause();
     }
 
-    // Withdraw function - requires signer signature using ERC712
-    function withdraw(
+    // Internal withdraw function - requires signer signature using ERC712
+    function _withdraw(
+        address user,
         uint256 amount,
         uint256 validUntil,
         bytes memory signature
-    ) external whenNotPaused nonReentrant {
+    ) internal {
         require(amount > 0, "Amount must be greater than 0");
         require(block.timestamp <= validUntil, "Signature expired");
         
         // Check contract has enough tokens
         require(token.balanceOf(address(this)) >= amount, "Insufficient contract balance");
 
-        uint256 currentNonce = nonces[msg.sender];
+        uint256 currentNonce = nonces[user];
         
         // Create ERC712 hash
         bytes32 structHash = keccak256(abi.encode(
             WITHDRAW_TYPEHASH,
-            msg.sender,
+            user,
             amount,
             currentNonce,
             validUntil,
@@ -91,12 +87,31 @@ contract InOutContract is Ownable, Pausable, ReentrancyGuard, EIP712 {
         require(signers[signer], "Invalid signer");
         
         // Increment nonce
-        nonces[msg.sender] = currentNonce + 1;
+        nonces[user] = currentNonce + 1;
         
         // Transfer tokens to user
-        token.safeTransfer(msg.sender, amount);
+        token.safeTransfer(user, amount);
         
-        emit Withdraw(msg.sender, amount, currentNonce);
+        emit Withdraw(user, amount, currentNonce);
+    }
+
+    // Withdraw function - user withdraws to their own address
+    function withdraw(
+        uint256 amount,
+        uint256 validUntil,
+        bytes memory signature
+    ) external whenNotPaused nonReentrant {
+        _withdraw(msg.sender, amount, validUntil, signature);
+    }
+
+    // Withdraw for - anyone can call to withdraw to a specified address
+    function withdrawFor(
+        address user,
+        uint256 amount,
+        uint256 validUntil,
+        bytes memory signature
+    ) external whenNotPaused nonReentrant {
+        _withdraw(user, amount, validUntil, signature);
     }
 
     // View functions
