@@ -328,8 +328,8 @@ describe("InOutContract", async function () {
     // Check owner balance before emergency withdraw
     const ownerBalanceBefore = await mockToken.read.balanceOf([owner.account.address]);
     
-    // Emergency withdraw
-    await inOutContract.write.emergencyWithdraw();
+    // Emergency withdraw - specify token address and amount
+    await inOutContract.write.emergencyWithdraw([mockToken.address, depositAmount]);
 
     // Check owner balance after emergency withdraw
     const ownerBalanceAfter = await mockToken.read.balanceOf([owner.account.address]);
@@ -338,6 +338,34 @@ describe("InOutContract", async function () {
     // Contract should have zero balance
     const contractBalance = await inOutContract.read.getContractBalance();
     assert.equal(contractBalance, 0n);
+  });
+
+  it("Should allow emergency withdraw of different tokens", async function () {
+    const [owner] = await viem.getWalletClients();
+    
+    // Deploy mock ERC20 token (main token)
+    const mockToken = await viem.deployContract("MockERC20", ["Test Token", "TEST"]);
+
+    // Deploy another mock ERC20 token (stuck token)
+    const stuckToken = await viem.deployContract("MockERC20", ["Stuck Token", "STUCK"]);
+
+    // Deploy InOutContract
+    const inOutContract = await viem.deployContract("InOutContract", [mockToken.address]);
+
+    const stuckAmount = parseEther("50");
+
+    // Mint stuck tokens directly to contract (simulating accidentally sent tokens)
+    await stuckToken.write.mint([inOutContract.address, stuckAmount]);
+
+    // Check owner balance before emergency withdraw
+    const ownerBalanceBefore = await stuckToken.read.balanceOf([owner.account.address]);
+    
+    // Emergency withdraw the stuck tokens
+    await inOutContract.write.emergencyWithdraw([stuckToken.address, stuckAmount]);
+
+    // Check owner received the stuck tokens
+    const ownerBalanceAfter = await stuckToken.read.balanceOf([owner.account.address]);
+    assert.equal(ownerBalanceAfter, ownerBalanceBefore + stuckAmount);
   });
 
   it("Should prevent replay attacks with nonce increment", async function () {
