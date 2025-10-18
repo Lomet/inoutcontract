@@ -1,7 +1,50 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { network } from "hardhat";
-import { parseEther, encodePacked, keccak256 } from "viem";
+import { parseEther, Address } from "viem";
+
+// Helper function to create ERC-712 signature for withdrawal
+async function signWithdrawal(
+  signer: any,
+  contractAddress: Address,
+  userAddress: Address,
+  amount: bigint,
+  nonce: bigint,
+  validUntil: bigint,
+  tokenAddr: Address
+) {
+  const domain = {
+    name: "InOutContract",
+    version: "1",
+    chainId: 31337, // Hardhat default chain ID
+    verifyingContract: contractAddress,
+  };
+
+  const types = {
+    Withdraw: [
+      { name: "user", type: "address" },
+      { name: "amount", type: "uint256" },
+      { name: "nonce", type: "uint256" },
+      { name: "validUntil", type: "uint256" },
+      { name: "tokenAddr", type: "address" },
+    ],
+  };
+
+  const message = {
+    user: userAddress,
+    amount: amount,
+    nonce: nonce,
+    validUntil: validUntil,
+    tokenAddr: tokenAddr,
+  };
+
+  return await signer.signTypedData({
+    domain,
+    types,
+    primaryType: "Withdraw",
+    message,
+  });
+}
 
 describe("InOutContract", async function () {
   const { viem } = await network.connect();
@@ -37,46 +80,22 @@ describe("InOutContract", async function () {
     assert.equal(isSignerAfter, false);
   });
 
-  it("Should allow deposits and update transactions correctly", async function () {
-    const [, user] = await viem.getWalletClients();
-    
+  it("Should allow pause and unpause by owner", async function () {
     // Deploy mock ERC20 token
     const mockToken = await viem.deployContract("MockERC20", ["Test Token", "TEST"]);
 
     // Deploy InOutContract
     const inOutContract = await viem.deployContract("InOutContract", [mockToken.address]);
 
-    const depositAmount = parseEther("100");
+    // Pause the contract
+    await inOutContract.write.pause();
 
-    // Mint tokens to user
-    await mockToken.write.mint([user.account.address, depositAmount]);
-
-    // Approve tokens for contract
-    await mockToken.write.approve([inOutContract.address, depositAmount], { account: user.account });
-
-    // Check initial transaction count and contract balance
-    const initialCount = await inOutContract.read.getUserTransactionCount([user.account.address]);
-    const initialContractBalance = await inOutContract.read.getContractBalance();
-    assert.equal(initialCount, 0n);
-    assert.equal(initialContractBalance, 0n);
-
-    // Deposit tokens
-    await inOutContract.write.deposit([depositAmount], { account: user.account });
-
-    // Check updated transaction count and contract balance
-    const finalCount = await inOutContract.read.getUserTransactionCount([user.account.address]);
-    const finalContractBalance = await inOutContract.read.getContractBalance();
-    assert.equal(finalCount, 1n);
-    assert.equal(finalContractBalance, depositAmount);
-
-    // Check transaction record
-    const [amount, isDeposit] = await inOutContract.read.getUserTransaction([user.account.address, 0n]);
-    assert.equal(amount, depositAmount);
-    assert.equal(isDeposit, true);
+    // Unpause the contract
+    await inOutContract.write.unpause();
   });
 
-  it("Should allow withdrawals with valid signer signature", async function () {
-    const [, signer, user] = await viem.getWalletClients();
+  it("Should allow withdrawals with valid ERC-712 signer signature", async function () {
+    const [owner, signer, user] = await viem.getWalletClients();
     
     // Deploy mock ERC20 token
     const mockToken = await viem.deployContract("MockERC20", ["Test Token", "TEST"]);
@@ -87,46 +106,44 @@ describe("InOutContract", async function () {
     // Add signer
     await inOutContract.write.addSigner([signer.account.address]);
 
-    const depositAmount = parseEther("100");
     const withdrawAmount = parseEther("50");
 
-    // Mint and deposit tokens
-    await mockToken.write.mint([user.account.address, depositAmount]);
-    await mockToken.write.approve([inOutContract.address, depositAmount], { account: user.account });
-    await inOutContract.write.deposit([depositAmount], { account: user.account });
+    // Mint tokens directly to contract (simulating deposits tracked by indexer)
+    await mockToken.write.mint([inOutContract.address, withdrawAmount]);
 
-    // Prepare withdrawal signature
-    const expectedTransactionIndex = 1n; // Second transaction (withdrawal)
+    // Get current nonce
+    const nonce = await inOutContract.read.getNonce([user.account.address]);
+    
+    // Prepare withdrawal signature using ERC-712
     const validUntil = BigInt(Math.floor(Date.now() / 1000) + 3600); // 1 hour from now
 
-    // Create message hash
-    const messageHash = keccak256(
-      encodePacked(
-        ["address", "uint256", "uint256", "uint256", "address"],
-        [user.account.address, withdrawAmount, expectedTransactionIndex, validUntil, inOutContract.address]
-      )
+    const signature = await signWithdrawal(
+      signer,
+      inOutContract.address,
+      user.account.address,
+      withdrawAmount,
+      nonce,
+      validUntil,
+      mockToken.address
     );
 
-    // Sign the message
-    const signature = await signer.signMessage({
-      message: { raw: messageHash },
-    });
+    // Get user balance before withdrawal
+    const userBalanceBefore = await mockToken.read.balanceOf([user.account.address]);
 
     // Perform withdrawal
-    await inOutContract.write.withdraw([withdrawAmount, expectedTransactionIndex, validUntil, signature], { account: user.account });
+    await inOutContract.write.withdraw([withdrawAmount, validUntil, signature], { account: user.account });
 
-    // Verify transaction count
-    const transactionCount = await inOutContract.read.getUserTransactionCount([user.account.address]);
-    assert.equal(transactionCount, 2n);
+    // Verify user received tokens
+    const userBalanceAfter = await mockToken.read.balanceOf([user.account.address]);
+    assert.equal(userBalanceAfter, userBalanceBefore + withdrawAmount);
 
-    // Verify withdrawal transaction record
-    const [amount, isDeposit] = await inOutContract.read.getUserTransaction([user.account.address, 1n]);
-    assert.equal(amount, withdrawAmount);
-    assert.equal(isDeposit, false);
+    // Verify nonce was incremented
+    const newNonce = await inOutContract.read.getNonce([user.account.address]);
+    assert.equal(newNonce, nonce + 1n);
 
-    // Verify contract balance
+    // Verify contract balance decreased
     const finalContractBalance = await inOutContract.read.getContractBalance();
-    assert.equal(finalContractBalance, depositAmount - withdrawAmount);
+    assert.equal(finalContractBalance, 0n);
   });
 
   it("Should reject withdrawals with invalid signatures", async function () {

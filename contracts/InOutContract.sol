@@ -2,35 +2,35 @@
 pragma solidity ^0.8.28;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Permit.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
-import "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 
-contract InOutContract is Ownable {
+contract InOutContract is Ownable, Pausable, ReentrancyGuard, EIP712 {
     using ECDSA for bytes32;
-    using MessageHashUtils for bytes32;
+    using SafeERC20 for IERC20;
 
     IERC20 public immutable token;
     
     // Signers authorized to approve withdrawals
     mapping(address => bool) public signers;
     
-    // Transaction record structure
-    struct TransactionRecord {
-        uint256 amount;
-        bool isDeposit; // true for deposit, false for withdrawal
-    }
+    // ERC712 type hash for withdraw
+    bytes32 public constant WITHDRAW_TYPEHASH = keccak256(
+        "Withdraw(address user,uint256 amount,uint256 nonce,uint256 validUntil,address tokenAddr)"
+    );
     
-    // User transaction history: user => array of records
-    mapping(address => TransactionRecord[]) public userTransactions;
+    // Nonce for each user to prevent replay attacks
+    mapping(address => uint256) public nonces;
 
-    event Deposit(address indexed user, uint256 amount, uint256 transactionIndex);
-    event Withdraw(address indexed user, uint256 amount, uint256 transactionIndex);
+    event Withdraw(address indexed user, uint256 amount, uint256 nonce);
     event SignerAdded(address indexed signer);
     event SignerRemoved(address indexed signer);
 
-    constructor(address _token) Ownable(msg.sender) {
+    constructor(address _token) Ownable(msg.sender) EIP712("InOutContract", "1") {
         require(_token != address(0), "Invalid token address");
         token = IERC20(_token);
     }
@@ -52,106 +52,54 @@ contract InOutContract is Ownable {
         emit SignerRemoved(_signer);
     }
 
-    // Deposit function - no signature required
-    function deposit(uint256 amount) external {
-        require(amount > 0, "Amount must be greater than 0");
-        
-        // Transfer tokens from user to contract
-        require(token.transferFrom(msg.sender, address(this), amount), "Transfer failed");
-        
-        // Record the transaction
-        uint256 transactionIndex = userTransactions[msg.sender].length;
-        userTransactions[msg.sender].push(TransactionRecord({
-            amount: amount,
-            isDeposit: true
-        }));
-        
-        emit Deposit(msg.sender, amount, transactionIndex);
+    function pause() external onlyOwner {
+        _pause();
     }
 
-    // Deposit with permit (ERC20Permit) - no signature required from signer
-    function depositWithPermit(
-        uint256 amount,
-        uint256 deadline,
-        uint8 v,
-        bytes32 r,
-        bytes32 s
-    ) external {
-        require(amount > 0, "Amount must be greater than 0");
-        
-        // Use permit to approve tokens
-        IERC20Permit(address(token)).permit(msg.sender, address(this), amount, deadline, v, r, s);
-        
-        // Transfer tokens from user to contract
-        require(token.transferFrom(msg.sender, address(this), amount), "Transfer failed");
-        
-        // Record the transaction
-        uint256 transactionIndex = userTransactions[msg.sender].length;
-        userTransactions[msg.sender].push(TransactionRecord({
-            amount: amount,
-            isDeposit: true
-        }));
-        
-        emit Deposit(msg.sender, amount, transactionIndex);
+    function unpause() external onlyOwner {
+        _unpause();
     }
 
-    // Withdraw function - requires signer signature
+    // Withdraw function - requires signer signature using ERC712
     function withdraw(
         uint256 amount,
-        uint256 expectedTransactionIndex,
         uint256 validUntil,
         bytes memory signature
-    ) external {
+    ) external whenNotPaused nonReentrant {
         require(amount > 0, "Amount must be greater than 0");
-        require(expectedTransactionIndex == userTransactions[msg.sender].length, "Invalid transaction index");
         require(block.timestamp <= validUntil, "Signature expired");
         
         // Check contract has enough tokens
         require(token.balanceOf(address(this)) >= amount, "Insufficient contract balance");
 
-        // Create message hash
-        bytes32 messageHash = keccak256(abi.encodePacked(
+        uint256 currentNonce = nonces[msg.sender];
+        
+        // Create ERC712 hash
+        bytes32 structHash = keccak256(abi.encode(
+            WITHDRAW_TYPEHASH,
             msg.sender,
             amount,
-            expectedTransactionIndex,
+            currentNonce,
             validUntil,
-            address(this)
+            address(token)
         ));
         
-        bytes32 ethSignedMessageHash = messageHash.toEthSignedMessageHash();
+        bytes32 hash = _hashTypedDataV4(structHash);
         
         // Verify signer signature
-        address signer = ethSignedMessageHash.recover(signature);
+        address signer = hash.recover(signature);
         require(signers[signer], "Invalid signer");
         
-        // Record the transaction
-        uint256 transactionIndex = userTransactions[msg.sender].length;
-        userTransactions[msg.sender].push(TransactionRecord({
-            amount: amount,
-            isDeposit: false
-        }));
+        // Increment nonce
+        nonces[msg.sender] = currentNonce + 1;
         
         // Transfer tokens to user
-        require(token.transfer(msg.sender, amount), "Transfer failed");
+        token.safeTransfer(msg.sender, amount);
         
-        emit Withdraw(msg.sender, amount, transactionIndex);
+        emit Withdraw(msg.sender, amount, currentNonce);
     }
 
     // View functions
-    function getUserTransactionCount(address user) external view returns (uint256) {
-        return userTransactions[user].length;
-    }
-    
-    function getUserTransaction(address user, uint256 index) external view returns (uint256 amount, bool isDeposit) {
-        require(index < userTransactions[user].length, "Transaction index out of bounds");
-        TransactionRecord memory record = userTransactions[user][index];
-        return (record.amount, record.isDeposit);
-    }
-    
-    function getUserTransactions(address user) external view returns (TransactionRecord[] memory) {
-        return userTransactions[user];
-    }
-    
     function getContractBalance() external view returns (uint256) {
         return token.balanceOf(address(this));
     }
@@ -160,9 +108,13 @@ contract InOutContract is Ownable {
         return signers[_signer];
     }
 
+    function getNonce(address user) external view returns (uint256) {
+        return nonces[user];
+    }
+
     // Emergency function for owner to withdraw contract tokens
     function emergencyWithdraw() external onlyOwner {
         uint256 contractBalance = token.balanceOf(address(this));
-        require(token.transfer(owner(), contractBalance), "Emergency withdraw failed");
+        token.safeTransfer(owner(), contractBalance);
     }
 }
