@@ -41,7 +41,11 @@ abstract contract InOutContractBase is Ownable, Pausable, ReentrancyGuard, EIP71
     // ============================================
 
     /// @notice Emitted when a withdrawal is successfully executed
-    event Withdraw(address indexed user, uint256 amount, uint256 nonce);
+    /// @param user The address that received the tokens
+    /// @param amount The amount of tokens withdrawn
+    /// @param nonce The nonce used for this withdrawal
+    /// @param validUntil The expiration timestamp of the signature
+    event Withdraw(address indexed user, uint256 amount, uint256 nonce, uint256 validUntil);
     
     /// @notice Emitted when a new signer is authorized
     event SignerAdded(address indexed signer);
@@ -172,7 +176,7 @@ abstract contract InOutContractBase is Ownable, Pausable, ReentrancyGuard, EIP71
         // Transfer tokens to user
         token.safeTransfer(user, amount);
         
-        emit Withdraw(user, amount, currentNonce);
+        emit Withdraw(user, amount, currentNonce, validUntil);
     }
 
     // ============================================
